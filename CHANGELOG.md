@@ -1,3 +1,8 @@
+## 1.1.3
+
+- Fixed a bug that prevented errors from surfacing at times.
+- Updated dependencies.
+
 ## 1.1.2
 
 - Fixed a bug that prevented the most recent versions of MariaDB from working.
