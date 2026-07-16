@@ -105,6 +105,7 @@ async function multiDb (params) {
       logger.error('Query attempted: ', query)
       logger.error('Params supplied: ', params)
       logger.error(e)
+      return { error: e }
     }
   }
 
@@ -168,6 +169,7 @@ async function multiDb (params) {
       logger.error('Query attempted: ', query)
       logger.error('Params supplied: ', params)
       logger.error(e)
+      return { error: e }
     }
   }
 
@@ -227,6 +229,7 @@ async function multiDb (params) {
       logger.error('Query attempted: ', query)
       logger.error('Params supplied: ', params)
       logger.error(e)
+      return { error: e }
     }
   }
 
@@ -305,6 +308,7 @@ async function multiDb (params) {
       logger.error('Query attempted: ', query)
       logger.error('Params supplied: ', params)
       logger.error(e)
+      return { error: e }
     }
   }
 
@@ -358,6 +362,7 @@ async function multiDb (params) {
       logger.error('Query attempted: ', query)
       logger.error('Params supplied: ', params)
       logger.error(e)
+      return { error: e }
     }
   }
 
