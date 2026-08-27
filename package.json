@@ -22,7 +22,7 @@
     "yesno": "0.4.0"
   },
   "devDependencies": {
-    "@electric-sql/pglite": "0.5.4",
+    "@electric-sql/pglite": "0.5.8",
     "better-sqlite3": "12.11.1",
     "c8": "12.0.0",
     "mariadb": "3.5.3",
