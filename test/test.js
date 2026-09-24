@@ -688,6 +688,72 @@ describe('multi-db-driver', function () {
   })
 })
 
+// which copy of a driver gets loaded needs no server either, only a directory that stands in for an app
+describe('Loading drivers', function () {
+  const loadDriver = require('../lib/loadDriver')
+  const appDir = path.join(os.tmpdir(), `multi-db-driver-load-driver-test-${process.pid}`)
+  const originalCwd = process.cwd()
+
+  before(function () {
+    // an app with its own copy of pg, which is not the copy multi-db-driver has as a development dependency
+    fs.mkdirSync(path.join(appDir, 'node_modules/pg'), { recursive: true })
+    fs.writeFileSync(path.join(appDir, 'package.json'), JSON.stringify({ name: 'app', dependencies: { pg: '*' } }))
+    fs.writeFileSync(path.join(appDir, 'node_modules/pg/package.json'), JSON.stringify({ name: 'pg', main: 'index.js' }))
+    fs.writeFileSync(path.join(appDir, 'node_modules/pg/index.js'), 'module.exports = { appCopy: true }')
+  })
+
+  afterEach(function () {
+    process.chdir(originalCwd)
+  })
+
+  after(function () {
+    fs.rmSync(appDir, { recursive: true, force: true })
+  })
+
+  it('should load a driver from the app rather than from multi-db-driver when both have it', async function () {
+    process.chdir(appDir)
+    assert.equal((await loadDriver('pg')).appCopy, true)
+  })
+
+  it('should fall back to multi-db-driver\'s own copy of a driver the app does not have', async function () {
+    process.chdir(appDir)
+    assert.equal(await loadDriver('better-sqlite3'), require('better-sqlite3'))
+  })
+})
+
+// placeholder rewriting needs no server, so it is tested directly against the rewriter rather than through a connection
+describe('Placeholder rewriting for PostgreSQL and PGlite', function () {
+  const rewrite = require('../lib/queryParser')
+
+  it('should number ? placeholders in order', function () {
+    assert.equal(rewrite('select * from t where a = ? and b = ?'), 'select * from t where a = $1 and b = $2')
+  })
+
+  it('should leave the rest of the query exactly as written', function () {
+    assert.equal(rewrite('SELECT "MixedCase".Id FROM MixedCase WHERE x = ?'), 'SELECT "MixedCase".Id FROM MixedCase WHERE x = $1')
+  })
+
+  it('should ignore ? inside strings, quoted identifiers, and comments', function () {
+    assert.equal(rewrite('select \'what?\', \'it\'\'s ?\', "we?ird" from t -- why?\nwhere a = ? /* a /* nested ? */ comment? */'), 'select \'what?\', \'it\'\'s ?\', "we?ird" from t -- why?\nwhere a = $1 /* a /* nested ? */ comment? */')
+  })
+
+  it('should honor backslash escapes in E strings', function () {
+    assert.equal(rewrite('select E\'a\\\' ?\', ?'), 'select E\'a\\\' ?\', $1')
+  })
+
+  it('should ignore ? inside dollar-quoted bodies', function () {
+    assert.equal(rewrite('select $$ body ? $$, $fn$ ? $fn$, ?'), 'select $$ body ? $$, $fn$ ? $fn$, $1')
+  })
+
+  it('should leave the jsonb ?| and ?& operators alone', function () {
+    assert.equal(rewrite('select data ?| array[?], data ?& array[?] from t'), 'select data ?| array[$1], data ?& array[$2] from t')
+  })
+
+  it('should leave a query already written with $1 placeholders untouched', function () {
+    assert.equal(rewrite('select * from t where a = $1 and b = ?'), 'select * from t where a = $1 and b = ?')
+  })
+})
+
 // MariaDB tests
 // the engines whose tests run against a connection this file opens directly. their tests were four near-identical copies, so they are generated from one place instead: anything genuinely per-engine lives in the spec below, and anything unique to one engine lives in its extraTests. pglite is not in here because its tests run in child processes, which makes them a different shape
 const sqlEngines = [
@@ -721,6 +787,69 @@ const sqlEngines = [
       adminConfig: { ...fixture.configs.postgres.adminConfig, host: 'bar' }
     }),
     extraTests (spec) {
+      it('should run queries concurrently rather than one at a time', async function () {
+        await createDatabase(spec.engine) // create database
+        const db = await connectTo(spec)
+        const started = Date.now()
+        await Promise.all([db.query('select pg_sleep(0.5)'), db.query('select pg_sleep(0.5)')])
+        const elapsed = Date.now() - started
+        await db.endConnection() // end connection
+        assert.ok(elapsed < 900, `two half second queries took ${elapsed}ms, so they ran one after the other`)
+      })
+
+      it('should accept native $1 placeholders with questionMarkParamsForPostgres left on', async function () {
+        await createDatabase(spec.engine) // create database
+        const db = await connectTo(spec)
+        await insertEachValue(db, '($1, $2)')
+        const result = await db.query('select * from test_table') // select all values from table
+        await db.endConnection() // end connection
+        assert.deepEqual(result.rows, values) // check if rows match inserted values
+      })
+
+      it('should guess credentials always, only in development, or never, as guessCredentials says', async function () {
+        await createDatabase(spec.engine) // create database
+        const defaults = multiDb.defaultCredentials.postgres
+        const saved = structuredClone(defaults)
+        const savedNodeEnv = process.env.NODE_ENV
+        defaults.splice(0, defaults.length, fixture.configs.postgres.adminConfig) // make the guess one that would succeed
+
+        // whether a connection with bad credentials ends up connected, under a given NODE_ENV and extra options
+        async function connects (nodeEnv, options = {}) {
+          if (nodeEnv === undefined) delete process.env.NODE_ENV
+          else process.env.NODE_ENV = nodeEnv
+          const db = await connectTo(spec, { driverConfig: spec.badConfig(), ...options })
+          const handle = spec.handle(db)
+          await db.endConnection()
+          return !!handle
+        }
+
+        const results = {
+          defaultWithNodeEnvUnset: await connects(undefined),
+          defaultInProduction: await connects('production'),
+          defaultInDevelopment: await connects('development'),
+          alwaysInProduction: await connects('production', { guessCredentials: true }),
+          developmentOnlyInProduction: await connects('production', { guessCredentials: 'development' }),
+          developmentOnlyInDevelopment: await connects('development', { guessCredentials: 'development' }),
+          neverInDevelopment: await connects('development', { guessCredentials: false }),
+          unrecognizedInDevelopment: await connects('development', { guessCredentials: 'dev' })
+        }
+
+        if (savedNodeEnv === undefined) delete process.env.NODE_ENV
+        else process.env.NODE_ENV = savedNodeEnv
+        defaults.splice(0, defaults.length, ...saved) // put the real defaults back
+
+        assert.deepEqual(results, {
+          defaultWithNodeEnvUnset: false, // a deployment that forgets to set NODE_ENV does not quietly connect as someone else
+          defaultInProduction: false,
+          defaultInDevelopment: true, // local servers differ between developers, which is what guessing is for
+          alwaysInProduction: true,
+          developmentOnlyInProduction: false,
+          developmentOnlyInDevelopment: true,
+          neverInDevelopment: false,
+          unrecognizedInDevelopment: false // a typo fails safe rather than guessing
+        })
+      })
+
       // postgres natively wants $1 rather than ?, so the driver rewrites placeholders unless this is turned off. that opt-out is only exercised here
       it('should accept native $1 placeholders when questionMarkParamsForPostgres is off', async function () {
         await createDatabase(spec.engine) // create database
@@ -829,6 +958,15 @@ for (const spec of sqlEngines) {
       const result = await db.query('select * from test_table') // select all values from table
       await db.endConnection() // end connection
       assert.deepEqual(result.rows, values) // check if rows match inserted values
+    })
+
+    it('should run a single insert whose first value is null as one query rather than as a transaction', async function () {
+      await createDatabase(spec.engine) // create database
+      const db = await connectTo(spec)
+      await db.query('insert into test_table (description, name) values (?, ?)', [null, 'magnus'])
+      const result = await db.query('select * from test_table') // select all values from table
+      await db.endConnection() // end connection
+      assert.deepEqual(result.rows, [{ name: 'magnus', description: null }]) // one row, with the null stored as a value
     })
 
     it('should delete all values from table', async function () {

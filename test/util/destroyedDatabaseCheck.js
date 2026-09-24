@@ -63,7 +63,7 @@ module.exports = async (db, droppedDatabase) => {
         break
       }
       case 'postgres': {
-        if (multiDbConnection.postgres.client.database === droppedDatabase) resolve('not destroyed')
+        if (multiDbConnection.postgres.database === droppedDatabase) resolve('not destroyed')
         else resolve('destroyed')
         break
       }

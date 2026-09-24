@@ -22,6 +22,15 @@ The following params are available when creating your Multi-DB Driver config fil
 
 - `admin` *[Boolean]*: Force the use of `adminConfig` for your database instead of the regular `config`. Default: `false`.
 
+- `guessCredentials` *[Boolean or String]*: Whether to try a series of common default credentials when the configured credentials cannot connect, then whichever of `config` or `adminConfig` was not tried first. Default: `'development'` for apps, `true` for the CLI scripts.
+  - Available options:
+    - `true`: Always guess.
+    - `'development'`: Guess only when the `NODE_ENV` environment variable is set to `development`. An unset `NODE_ENV` counts as not development, so a deployment that forgets to set it does not guess.
+    - `false`: Never guess.
+  - Guessing is limited to development for apps by default because a deployed app whose own credentials fail would otherwise quietly connect as a superuser, possibly to a different database entirely.
+  - Any other value is reported as an error and treated as `false`.
+  - A warning is logged whenever a guessed set of credentials is the one that connects.
+
 - `schema` *[String]*: Relative path to a file with what set of SQL statements you want to execute against your database when it is freshly created, if any. Default: `undefined`.
 
 - `loggerConfig` *[Object]*: Options to suppress various kinds of logging.
@@ -31,12 +40,16 @@ Default:
 ```json
 loggerConfig: {
   log: true, // regular logs
+  warn: true, // warnings
   error: true, // logging errors
   verbose: true // verbose logging
 }
 ```
 
 - `questionMarkParamsForPostgres` *[Boolean]*: Automatically convert parameterized query placeholders from `?` to `$ + number` within Multi-DB Driver for PostgreSQL queries so you can use the `?` syntax in PostgreSQL queries, which isn't possible in native PostgreSQL queries. Default: `true`.
+  - Only the placeholders are changed; the rest of the query is left exactly as written. A `?` inside a string, a quoted identifier, a comment, or a dollar-quoted body is left alone, as are the jsonb `?|` and `?&` operators.
+  - A query that already uses `$1` style placeholders is left untouched, so you can write native PostgreSQL queries without turning this off.
+  - The jsonb `?` operator on its own cannot be told apart from a placeholder, so a query that uses it needs `disableQuestionMarkParamsForPostgres` set in its query object.
 
 - `mergeConfig` *[Boolean]*: Merge config values passed via constructor or environment variable with any `.multi-db-config.json` or `.multi-db-driver-config.json` file detected in your app's directory structure. Default: `true`.
 
