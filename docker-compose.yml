@@ -25,7 +25,7 @@ services:
       retries: 30
 
   mysql:
-    image: mysql:8.0
+    image: mysql:9.6
     environment:
       MYSQL_ROOT_PASSWORD: password
     tmpfs:
