@@ -11,7 +11,7 @@
 services:
   postgres:
     # keep this in step with the postgresql-client the Dockerfile installs: pg_dump refuses to dump a server newer than itself
-    image: postgres:17-bookworm
+    image: postgres:18-bookworm
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
