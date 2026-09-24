@@ -37,7 +37,7 @@ services:
       retries: 45
 
   mariadb:
-    image: mariadb:11.4
+    image: mariadb:11.8
     environment:
       MARIADB_ROOT_PASSWORD: password
     tmpfs:
