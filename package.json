@@ -8,7 +8,7 @@
       "url": "https://github.com/rooseveltframework/multi-db-driver/graphs/contributors"
     }
   ],
-  "version": "1.2.2",
+  "version": "1.3.0",
   "homepage": "https://rooseveltframework.org/docs/multi-db-driver/latest",
   "license": "CC-BY-4.0",
   "main": "multi-db-driver.js",
@@ -24,7 +24,6 @@
     "node": ">=22.0.0"
   },
   "dependencies": {
-    "node-sql-parser": "5.4.0",
     "roosevelt-logger": "2.0.0",
     "yesno": "0.4.0"
   },

@@ -5,6 +5,7 @@ const Logger = require('roosevelt-logger')
 const configFinder = require('./lib/configFinder')
 const resolvePath = require('./lib/resolvePath')
 const queryParser = require('./lib/queryParser')
+const loadDriver = require('./lib/loadDriver')
 
 async function multiDb (params) {
   const logger = new Logger()
@@ -13,6 +14,7 @@ async function multiDb (params) {
 
   if (config.loggerConfig) {
     if (config.loggerConfig.log === false) logger.log = function () {}
+    if (config.loggerConfig.warn === false) logger.warn = function () {}
     if (config.loggerConfig.error === false) logger.error = function () {}
     if (config.loggerConfig.verbose === false) logger.verbose = function () {}
   }
@@ -21,16 +23,11 @@ async function multiDb (params) {
   //
   // a driver that is still a string here has not been loaded yet, so a failure means its package is genuinely absent. on a later call the entry already holds the loaded module, and the load is skipped rather than counted as missing
   const missingDrivers = {}
+  const connectionFailures = {} // why each set of credentials an engine tried could not connect, reported if none of them could
   for (const key in multiDb.drivers) {
     const packageName = typeof multiDb.drivers[key] === 'string' ? multiDb.drivers[key] : null
     try {
-      if (multiDb.drivers[key] === '@electric-sql/pglite') {
-        multiDb.drivers[key] = await import(multiDb.drivers[key])
-      } else if (Object.getPrototypeOf(multiDb.drivers[key]) === null) {
-        // do  nothing
-      } else {
-        multiDb.drivers[key] = require(multiDb.drivers[key])
-      }
+      if (packageName) multiDb.drivers[key] = await loadDriver(packageName) // loaded from the app, which is what installs the drivers
     } catch (e) {
       if (packageName) missingDrivers[key] = packageName
       // the module isn't in node_modules. this is only worth logging here in a verbose mode: whether it matters depends on whether the config actually asks for that database, which is reported per engine below
@@ -56,29 +53,31 @@ async function multiDb (params) {
   function reportInitFailure (engine, emoji, label) {
     const missing = missingDrivers[engine]
     if (missing) logger.error(emoji, `Cannot use ${label}: its driver is not installed. Run: npm i ${installNameFor(missing)}`)
-    else logger.error(emoji, `Could not initialize ${label} module. Please make sure it is configured properly.`)
+    else logger.error(emoji, `Could not initialize ${label} module. Please make sure it is configured properly.${connectionFailures[engine]?.length ? ' Connection attempts: ' + connectionFailures[engine].join('; ') : ''}`)
   }
 
   // normalize all db drivers to one api and initialize the db drivers
   const db = {
     config,
-    drivers: multiDb.drivers,
-    modifiedQueryCache: {}
+    drivers: multiDb.drivers
   }
   let connected
 
   // the shared identity of each engine: how it is named in logs, and where its live handle lives once connected
   const engines = {
-    mariadb: { engine: 'mariadb', emoji: '🦭', label: 'MariaDB', handle: () => db.mariadb.conn },
-    mysql: { engine: 'mysql', emoji: '🐬', label: 'MySQL', handle: () => db.mysql.conn },
+    mariadb: { engine: 'mariadb', emoji: '🦭', label: 'MariaDB', handle: () => db.mariadb.pool },
+    mysql: { engine: 'mysql', emoji: '🐬', label: 'MySQL', handle: () => db.mysql.pool },
     pglite: { engine: 'pglite', emoji: '⚡️', label: 'PGlite', handle: () => db.pglite.db },
-    postgres: { engine: 'postgres', emoji: '🐘', label: 'PostgreSQL', handle: () => db.postgres.client },
+    postgres: { engine: 'postgres', emoji: '🐘', label: 'PostgreSQL', handle: () => db.postgres.pool },
     sqlite: { engine: 'sqlite', emoji: '🪶', label: 'SQLite', handle: () => db.sqlite.db }
   }
 
-  // an array of objects or an array of arrays as the params means the caller wants each set run as one transaction. selects are excluded because there is nothing to commit
+  // an array of rows, each one an array or a plain object, means the caller wants each row run as one transaction. selects are excluded because there is nothing to commit
+  //
+  // every param has to be a row for this to count. checking only the first one used to treat a single insert whose first value was null, a date, or a buffer as a transaction, which ran it once per value and threw on the null
   function isTransaction (query, params) {
-    return !query.trim().toLowerCase().startsWith('select') && params && typeof params[0] === 'object'
+    if (query.trim().toLowerCase().startsWith('select') || !Array.isArray(params) || !params.length) return false
+    return params.every(param => Array.isArray(param) || (param !== null && Object.getPrototypeOf(param) === Object.prototype))
   }
 
   // a transaction's params arrive as either objects or arrays, and most drivers want positional values either way
@@ -86,45 +85,82 @@ async function multiDb (params) {
     return Array.isArray(param) ? param : Object.values(param)
   }
 
-  // try the configured credentials, then the common defaults, then whichever of the admin or regular credentials was not tried first. the first set that connects wins and the rest are never attempted
+  // connect with the configured credentials. when guessing is on, the common default credentials are tried next, then whichever of the admin or regular credentials was not tried first. the first set that connects wins and the rest are never attempted
+  //
+  // guessCredentials is true to always guess, 'development' to guess only when NODE_ENV is development, or false to never guess. apps default to 'development', which is where developers' local servers differ from one another, because a deployed app whose own credentials fail would otherwise quietly connect as a superuser, possibly to another database entirely, which is a worse failure than not connecting. the cli defaults to true, since it is what runs with admin credentials during setup
+  //
+  // NODE_ENV is used because it is the convention most node tooling already follows, rather than anything specific to one framework. an unset NODE_ENV does not count as development, so a deployment that forgets to set it fails safe
+  //
+  // open receives the credentials and throws if it cannot connect. it is responsible for closing anything it opened before throwing, so that a failed attempt does not leave a pool behind
   async function connectWithLadder (spec, open) {
     const name = spec.engine
-    const credentialsToTry = config[name]
-      ? [
-          config.admin ? config[name].adminConfig : config[name].config, // default to admin config if the admin flag is passed
-          ...multiDb.defaultCredentials[name], // try some default credentials if the above doesn't work
-          config.admin ? config[name].config : config[name].adminConfig // if none of those worked, try either the admin credentials or the user credentials, whichever wasn't used above
-        ]
-      : []
+    if (!config[name]) return false
+    const configured = config.admin ? config[name].adminConfig : config[name].config // default to admin config if the admin flag is passed
+    const credentialsToTry = [configured]
+    if (guessCredentials) {
+      credentialsToTry.push(
+        ...multiDb.defaultCredentials[name], // try some default credentials if the configured ones don't work
+        config.admin ? config[name].config : config[name].adminConfig // if none of those worked, try either the admin credentials or the user credentials, whichever wasn't used above
+      )
+    }
+    const failures = connectionFailures[name] = []
     for (const credentials of credentialsToTry) {
+      if (!credentials) continue // an adminConfig or config that was never supplied
       try {
         await open(credentials)
+        if (credentials !== configured) logger.warn('⚠️', `${spec.emoji} ${spec.label} could not connect with the configured credentials, so it connected with guessed credentials instead: user ${credentials.user}, database ${credentials.database}`)
         logger.log(spec.emoji, `${spec.label} database connected with user ${credentials.user} to database ${credentials.database}`)
         db[name].username = credentials.user
         db[name].database = credentials.database
         return true
       } catch (e) {
-        // do nothing, try the next set of credentials
+        failures.push(`user ${credentials.user} on ${credentials.host || 'localhost'}${credentials.port ? ':' + credentials.port : ''}: ${String(e.message || e.code || e).split('\n')[0]}`) // first line only, so the report stays on one line
       }
     }
     return false
   }
 
-  // postgres and pglite want $1 style placeholders, so a query written with ? is rewritten for them and the result cached. a query that cannot be parsed is run as written
-  async function rewriteForPostgres (query, skipAST) {
-    if (config.questionMarkParamsForPostgres === false) skipAST = true
-    if (skipAST) return query
-    if (db.modifiedQueryCache[query]) return db.modifiedQueryCache[query]
+  // resolves guessCredentials to whether this connection should guess. a value that is not one of the three recognized ones is reported and treated as false, because guessing by mistake is the unsafe direction to fail in
+  function shouldGuessCredentials () {
+    const setting = config.guessCredentials ?? (isCli ? true : 'development')
+    if (setting === true || setting === false) return setting
+    if (setting === 'development') return process.env.NODE_ENV === 'development'
+    logger.error(`guessCredentials must be true, false, or 'development', but it is set to ${JSON.stringify(setting)}, so credentials will not be guessed.`)
+    return false
+  }
+  const guessCredentials = shouldGuessCredentials() // resolved once, so a bad value is reported once rather than once per database
+
+  // postgres and pglite want $1 style placeholders, so a query written with ? is rewritten for them
+  function rewriteForPostgres (query, skipRewrite) {
+    if (config.questionMarkParamsForPostgres === false || skipRewrite) return query
+    return queryParser(query)
+  }
+
+  // opens a pool and proves the credentials work by checking a connection out of it and handing it straight back. queries then go through the pool, so they can run concurrently and a dropped connection is replaced instead of breaking every query after it
+  async function openPool (createPool, checkOut, credentials) {
+    const pool = await createPool(credentials)
     try {
-      const modifiedQuery = await queryParser(query)
-      if (modifiedQuery) {
-        db.modifiedQueryCache[query] = modifiedQuery
-        return modifiedQuery
-      }
+      const connection = await checkOut(pool)
+      await connection.release()
+      return pool
     } catch (e) {
-      // the query could not be parsed, so use it unchanged
+      await pool.end().catch(() => {}) // a pool whose credentials failed would otherwise keep the process alive
+      throw e
     }
-    return query
+  }
+
+  // runs one query per row inside a transaction on a single checked-out connection, because a transaction only means anything if every statement in it goes over the same connection
+  async function transaction (connection, { begin, commit, rollback }, query, params) {
+    try {
+      await begin()
+      for (const param of params) await connection.query(query, positional(param))
+      await commit()
+    } catch (e) {
+      await rollback()
+      throw e
+    } finally {
+      await connection.release()
+    }
   }
 
   // every engine reports a query failure the same way, and none of them may let a driver level exception escape to the caller
@@ -149,23 +185,17 @@ async function multiDb (params) {
       credentials.allowPublicKeyRetrieval = true
     }
     const { createPool } = multiDb.drivers.mariadb
-    db.mariadb.pool = await createPool(credentials)
-    db.mariadb.conn = await db.mariadb.pool.getConnection()
+    db.mariadb.pool = await openPool(createPool, pool => pool.getConnection(), credentials)
+    db.mariadb.conn = db.mariadb.pool // the pool answers query() the same way the single connection this used to be did, so code reaching for conn keeps working
   })
   if (!connected && config.mariadb) reportInitFailure('mariadb', engines.mariadb.emoji, 'MariaDB')
   db.mariadb.query = async (query, params) => runQuery(engines.mariadb, query, params, async () => {
     let result
     if (isTransaction(query, params)) {
-      try {
-        await db.mariadb.conn.beginTransaction()
-        for (const param of params) await db.mariadb.conn.query(query, positional(param))
-        await db.mariadb.conn.commit()
-      } catch (e) {
-        await db.mariadb.conn.rollback()
-        throw e
-      }
+      const conn = await db.mariadb.pool.getConnection()
+      await transaction(conn, { begin: () => conn.beginTransaction(), commit: () => conn.commit(), rollback: () => conn.rollback() }, query, params)
     } else {
-      result = await db.mariadb.conn.query(query, params)
+      result = await db.mariadb.pool.query(query, params)
     }
     return { rows: result }
   })
@@ -174,23 +204,17 @@ async function multiDb (params) {
   connected = await connectWithLadder(engines.mysql, async credentials => {
     if (isCli) credentials.multipleStatements = true
     const { createPool } = multiDb.drivers.mysql
-    db.mysql.pool = await createPool(credentials)
-    db.mysql.conn = await db.mysql.pool.getConnection()
+    db.mysql.pool = await openPool(createPool, pool => pool.getConnection(), credentials)
+    db.mysql.conn = db.mysql.pool // the pool answers query() the same way the single connection this used to be did, so code reaching for conn keeps working
   })
   if (!connected && config.mysql) reportInitFailure('mysql', engines.mysql.emoji, 'MySQL')
   db.mysql.query = async (query, params) => runQuery(engines.mysql, query, params, async () => {
     let result
     if (isTransaction(query, params)) {
-      try {
-        await db.mysql.conn.beginTransaction()
-        for (const param of params) await db.mysql.conn.query(query, positional(param))
-        await db.mysql.conn.commit()
-      } catch (e) {
-        await db.mysql.conn.rollback()
-        throw e
-      }
+      const conn = await db.mysql.pool.getConnection()
+      await transaction(conn, { begin: () => conn.beginTransaction(), commit: () => conn.commit(), rollback: () => conn.rollback() }, query, params)
     } else {
-      result = await db.mysql.conn.query(query, params)
+      result = await db.mysql.pool.query(query, params)
     }
     // mysql2 hands back [rows, fields], so the rows are surfaced alongside the whole response rather than in place of it
     const wrapped = { full: result }
@@ -210,9 +234,9 @@ async function multiDb (params) {
     }
     if (!connected && config.pglite) reportInitFailure('pglite', engines.pglite.emoji, 'PGlite')
   }
-  db.pglite.query = async (query, params, skipAST) => runQuery(engines.pglite, query, params, async () => {
+  db.pglite.query = async (query, params, skipRewrite) => runQuery(engines.pglite, query, params, async () => {
     if (isCli) return await db.pglite.db.exec(query)
-    const queryToUse = await rewriteForPostgres(query, skipAST)
+    const queryToUse = rewriteForPostgres(query, skipRewrite)
     if (isTransaction(query, params)) {
       await db.pglite.db.transaction(async (tx) => {
         try {
@@ -230,27 +254,23 @@ async function multiDb (params) {
   db.postgres = {}
   connected = await connectWithLadder(engines.postgres, async credentials => {
     const { Pool } = multiDb.drivers.postgres
-    db.postgres.pool = new Pool(credentials)
-    db.postgres.client = await db.postgres.pool.connect()
-    db.postgres.client.on('error', (e) => {
+    db.postgres.pool = await openPool(creds => new Pool(creds), pool => pool.connect(), credentials)
+
+    // an idle client that loses its connection emits an error on the pool, which crashes the process if nothing is listening. the pool throws that client away and opens a new one for the next query
+    db.postgres.pool.on('error', (e) => {
       logger.error(engines.postgres.emoji, 'PostgreSQL error...')
       logger.error(e)
     })
+    db.postgres.client = db.postgres.pool // the pool answers query() the same way the single client this used to be did, so code reaching for client keeps working
   })
   if (!connected && config.postgres) reportInitFailure('postgres', engines.postgres.emoji, 'PostgreSQL')
-  db.postgres.query = async (query, params, skipAST) => runQuery(engines.postgres, query, params, async () => {
-    const queryToUse = await rewriteForPostgres(query, skipAST)
+  db.postgres.query = async (query, params, skipRewrite) => runQuery(engines.postgres, query, params, async () => {
+    const queryToUse = rewriteForPostgres(query, skipRewrite)
     if (isTransaction(query, params)) {
-      try {
-        await db.postgres.client.query('BEGIN')
-        for (const param of params) await db.postgres.client.query(queryToUse, positional(param))
-        await db.postgres.client.query('COMMIT')
-      } catch (e) {
-        await db.postgres.client.query('ROLLBACK')
-        throw e
-      }
+      const client = await db.postgres.pool.connect()
+      await transaction(client, { begin: () => client.query('BEGIN'), commit: () => client.query('COMMIT'), rollback: () => client.query('ROLLBACK') }, queryToUse, params)
     } else {
-      return await db.postgres.client.query(queryToUse, params)
+      return await db.postgres.pool.query(queryToUse, params)
     }
   })
 
@@ -277,7 +297,7 @@ async function multiDb (params) {
     if (isCli) return await db.sqlite.db.exec(query)
     let result
     if (!query.trim().toLowerCase().startsWith('select')) {
-      if (params && typeof params[0] === 'object') {
+      if (isTransaction(query, params)) {
         // it's an array of objects or an array of arrays, so perform a transaction. the params are passed through untouched because sqlite binds named parameters such as @name from the object itself
         const transaction = await db.sqlite.db.prepare(query)
         const transactionRunner = await db.sqlite.db.transaction((paramsArray) => {
@@ -356,19 +376,10 @@ async function multiDb (params) {
   // universal end connection method
   db.endConnection = async () => {
     const closers = {
-      mariadb: async () => {
-        await db.mariadb.conn.release()
-        await db.mariadb.pool.end()
-      },
-      mysql: async () => {
-        await db.mysql.conn.release()
-        await db.mysql.pool.end()
-      },
+      mariadb: async () => await db.mariadb.pool.end(),
+      mysql: async () => await db.mysql.pool.end(),
       pglite: async () => await db.pglite.db.close(),
-      postgres: async () => {
-        await db.postgres.client.release()
-        await db.postgres.pool.end()
-      },
+      postgres: async () => await db.postgres.pool.end(),
       sqlite: async () => await db.sqlite.db.close()
     }
     for (const name of Object.keys(closers)) {

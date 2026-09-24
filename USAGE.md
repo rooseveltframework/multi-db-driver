@@ -100,7 +100,7 @@ This supplies an object instead of a string to the query argument.
 
 It also combines all the other above features too, showing a maximally featureful and flexible version of the query method.
 
-By default Multi-DB Driver will rewrite the query under the hood to use `$1` instead of `?` for queries being executed against PostgreSQL and PGlite. You can disable this behavior by setting `questionMarkParamsForPostgres` to `false` in your Multi-DB Driver config, or by setting `disableQuestionMarkParamsForPostgres` to `true` at the query level in the query object.
+By default Multi-DB Driver will rewrite the query under the hood to use `$1` instead of `?` for queries being executed against PostgreSQL and PGlite. Only the placeholders are changed, and a query already written with `$1` style placeholders is left untouched. You can disable this behavior by setting `questionMarkParamsForPostgres` to `false` in your Multi-DB Driver config, or by setting `disableQuestionMarkParamsForPostgres` to `true` at the query level in the query object.
 
 ## CLI scripts
 

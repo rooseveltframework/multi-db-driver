@@ -1,3 +1,15 @@
+## 1.3.0
+
+- Breaking: Apps no longer fall back to guessed credentials when their configured credentials fail, unless the `NODE_ENV` environment variable is set to `development`. The new `guessCredentials` param controls this: set it to `true` to always guess, which restores the old behavior, `'development'` to guess only in development, which is the default for apps, or `false` to never guess, including from the CLI. A warning is now logged whenever a guessed set of credentials is the one that connects.
+- Changed MariaDB, MySQL, and PostgreSQL queries to go through the connection pool rather than through one connection checked out of it at startup. This change should improve performance and stability.
+- Fixed a bug that caused a single insert or update to be run as a transaction when its first param was `null`, a date, a buffer, or any other object, which ran the query once per param and threw on `null`. Params are now treated as transaction rows only when every one of them is an array or a plain object.
+- Fixed a bug that caused a failed connection attempt to leave its pool open, which could keep the process from exiting.
+- Fixed a bug that caused an idle PostgreSQL connection that dropped to crash the process, since the error it emits had no listener.
+- Fixed the reason each connection attempt failed being thrown away. When no credentials connect, each attempt and its error are now logged.
+- Fixed `loggerConfig.warn` being ignored, which prevented the CLI's `--suppress-logs` flag from suppressing warnings.
+- Fixed database drivers being loaded from Multi-DB Driver's own dependencies rather than the app's whenever it has copies of its own, such as when it is linked to a clone or installed by a package manager that keeps each package's dependencies apart, such as pnpm. Drivers are now loaded from the app, found from the working directory the same way the config file is, with Multi-DB Driver's own copy as the fallback.
+- Updated dependencies.
+
 ## 1.2.2
 
 - Fixed a bug that caused the message logged on a successful database connection to print `[Function: bold]` instead of naming the user and database that were connected to.
