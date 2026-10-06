@@ -1,7 +1,7 @@
 # test runner image for the containerised suite. see docker-compose.yml
 
 # trixie rather than bookworm because pg_dump refuses to dump a server newer than itself, and bookworm only ships the postgresql 15 client while docker-compose.yml runs postgres 17
-FROM node:22-trixie-slim
+FROM node:24-trixie-slim
 
 # the database clients are what the cli.js dump commands shell out to, which is what lets the dump tests run for real
 RUN apt-get update && apt-get install -y --no-install-recommends \
