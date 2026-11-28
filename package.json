@@ -24,7 +24,7 @@
     "node": ">=22.0.0"
   },
   "dependencies": {
-    "roosevelt-logger": "2.0.0",
+    "roosevelt-logger": "2.0.1",
     "yesno": "0.4.0"
   },
   "devDependencies": {
